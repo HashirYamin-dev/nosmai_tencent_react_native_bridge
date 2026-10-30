@@ -1,0 +1,7 @@
+android/.gradle/
+android/build/
+android/.cxx/
+ios/Pods/
+ios/build/
+node_modules/
+*.tgz
