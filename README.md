@@ -69,6 +69,8 @@ import {
 | `NosmaiTencentBridge.stopStreaming()` | Stop Host stream |
 | `NosmaiTencentBridge.getHostState()` | Read `{ active, connected }` |
 | `NosmaiTencentBridge.getHostFps()` | Read source, submitted, uplink FPS/bitrate and dimensions |
+| `NosmaiTencentBridge.muteLocalAudio(mute)` | Host, while streaming: mute/unmute the published mic (resets on stop) |
+| `NosmaiTencentBridge.muteLocalVideo(mute)` | Host, while streaming: pause/resume the published video (resets on stop) |
 | `NosmaiTencentEvents.subscribe(callback)` | Subscribe to Host native events (remove the returned subscription) |
 | `NosmaiTencentBridge.dispose()` | Release native bridge session resources |
 | `NosmaiTencentBridge.initializeNosmaiCamera(license)` | **iOS Host only:** initialize bridge-owned Nosmai camera |
@@ -142,6 +144,16 @@ npx tsc --noEmit
 
 In the configuration output, both `@nosmai/react-native-effects-sdk` and `react-native-nosmai-tencent-bridge` should have an Android and/or iOS native entry. **Build and install the native app** after adding this package; JavaScript hot reload does not register native modules.
 
+### Check your native setup automatically
+
+After finishing sections 4 and 5, run the read-only setup checker from your app root:
+
+```bash
+npx nosmai-tencent-doctor
+```
+
+It reports missing `newArchEnabled`, a low `minSdkVersion`, duplicate Nosmai AARs, a low iOS deployment target, missing `Info.plist` camera/microphone descriptions, and missing Pods. It never changes files. Exit code `1` means a blocking problem was found.
+
 ## 4. Android native setup
 
 ### 4.1 Configure Android SDK and New Architecture
@@ -182,13 +194,16 @@ If Kotlin reports unresolved `NosmaiFilterInfo` / `NosmaiPipelineState`, resolve
 
 ### 4.3 Camera, microphone and Internet permissions
 
-Add these to `android/app/src/main/AndroidManifest.xml` if not already present:
+**No manifest edit is needed.** The bridge's own manifest declares these, and Android merges them into your app automatically:
 
 ```xml
 <uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 <uses-permission android:name="android.permission.CAMERA" />
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
 ```
+
+A Viewer-only app that should not declare the camera can remove it in its own manifest with `<uses-permission android:name="android.permission.CAMERA" tools:node="remove" />`.
 
 Request Host camera and microphone permissions **at runtime** (Android 6+). The Viewer doesn't need to initialize Nosmai or request Host camera permission.
 
@@ -511,6 +526,45 @@ viewerSubscription.remove();
 ```
 
 Typical events include `joining`, `joined`, `joinFailed`, `firstVideoFrame`, `firstAudioFrame`, `connectionLost`, `connectionRecovered`, `left`, `error`, and Viewer diagnostics such as `videoAvailable`, `viewAttached` or `viewMissing`. Exact events depend on native SDK conditions and package version.
+
+Host diagnostics on **both** Android and iOS:
+
+| Host event | Meaning |
+| --- | --- |
+| `firstSourceFrame` | The first processed Nosmai frame reached the bridge (`width`, `height`) |
+| `noProcessedFrames` | No processed frames ~3 s after start — the room/audio may be live while video is black |
+| `fpsStats` | Periodic TRTC send statistics (`fps`, `kbps`, `width`, `height`), so you don't have to poll `getHostFps()` |
+
+If Host room entry fails (`joinFailed`), the bridge now releases the microphone, custom capture and Nosmai dual output by itself.
+
+### Host effects: beauty, filters, AR, background (Android and iOS)
+
+`NosmaiTencentEffects` is one API for both platforms. On Android it calls the Nosmai RN SDK; on iOS, where this bridge owns the Host camera, it calls the bridge's native effects methods (the RN SDK visual APIs reject on the iOS Host because they need their own camera owner). Use it after the Host reports `ready`.
+
+```tsx
+import {NosmaiTencentEffects} from 'react-native-nosmai-tencent-bridge';
+
+const caps = await NosmaiTencentEffects.getCapabilities();      // {beauty, cloud, advanced} for this license
+await NosmaiTencentEffects.setBeauty('skinSmoothing', 0.5);      // skinSmoothing | skinWhitening | teethWhitening, 0..1
+await NosmaiTencentEffects.setReshape('faceSlim', 0.3);          // faceSlim, eye, nose, chin, lip, jaw, brow, ..., -1..1
+const filters = await NosmaiTencentEffects.getCloudPackages('filter'); // or getLocalPackages(type)
+await NosmaiTencentEffects.applyCloudPackage(filters[0]);        // downloads if needed, then applies
+await NosmaiTencentEffects.setBackground({mode: 'blur', blurStrength: 0.6}); // or color / image / video
+await NosmaiTencentEffects.clear('filter');                      // filter | effect | background | beauty | reshape | all
+```
+
+Package types: `filter`, `effect` (AR), `beauty_effect`, `background`, `game`. Everything applied on the Host is part of the published stream, so Viewers see it. On iOS, cloud downloads also emit `cloudDownloadProgress` Host events (`filterId`, `progress` 0..1).
+
+### Host video quality
+
+`startStreaming()` and `<NosmaiTencentHost session={...} />` accept an optional `video` object. Omitted fields keep the tested defaults (720p portrait, 30 FPS, 1800 kbps). Invalid values are rejected before anything starts.
+
+```tsx
+await NosmaiTencentBridge.startStreaming({
+  ...hostCredentials,
+  video: { resolution: '540p', fps: 24, bitrateKbps: 1200 }, // '360p' | '540p' | '720p' | '1080p'; fps 1–30; bitrate 100–8000
+});
+```
 
 ### Host FPS / uplink statistics
 
