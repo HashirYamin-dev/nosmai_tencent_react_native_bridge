@@ -22,9 +22,10 @@
 #error Tencent TRTC public headers not found; check the resolved CocoaPod/framework.
 #endif
 
-// A single TRTCCloud role per Flutter engine: publisher OR audience. All TRTC
-// session operations happen on main; frames are submitted on Nosmai's render
-// callback thread without round-tripping pixels through Dart.
+// A single TRTCCloud role per React Native app: publisher OR audience. All TRTC
+// session operations happen on main (TRTC also delivers delegate callbacks on
+// the main queue by default); frames are submitted on Nosmai's render callback
+// thread without round-tripping pixels through JavaScript.
 
 static __weak NosmaiTencentBridgeRN *ntbActiveBridge;
 
@@ -51,6 +52,8 @@ static __weak NosmaiTencentBridgeRN *ntbActiveBridge;
 @property(nonatomic, weak) UIView *nosmaiPreviewView;
 @property(nonatomic, assign) BOOL nosmaiInitialized;
 @property(nonatomic, assign) BOOL nosmaiCapturing;
+@property(nonatomic, assign) BOOL audioMuted;
+@property(nonatomic, assign) BOOL videoMuted;
 - (void)stopNosmaiCapture;
 - (void)stopHost;
 @end
@@ -240,6 +243,45 @@ RCT_EXPORT_MODULE(NosmaiTencentBridge)
   return YES;
 }
 
+// Optional `video` options; omitted fields keep the tested 720p / 30 FPS /
+// 1800 kbps defaults. Returns nil and sets *error on invalid input.
+- (TRTCVideoEncParam *)encoderParam:(NSDictionary *)args error:(NSString **)error {
+  id raw = args[@"video"];
+  NSDictionary *video = [raw isKindOfClass:[NSDictionary class]] ? raw : nil;
+  if (raw && raw != [NSNull null] && !video) { *error = @"video must be an object"; return nil; }
+  TRTCVideoResolution resolution = TRTCVideoResolution_1280_720;
+  id res = video[@"resolution"];
+  if (res && res != [NSNull null]) {
+    if ([res isEqual:@"360p"]) resolution = TRTCVideoResolution_640_360;
+    else if ([res isEqual:@"540p"]) resolution = TRTCVideoResolution_960_540;
+    else if ([res isEqual:@"720p"]) resolution = TRTCVideoResolution_1280_720;
+    else if ([res isEqual:@"1080p"]) resolution = TRTCVideoResolution_1920_1080;
+    else { *error = @"video.resolution must be 360p, 540p, 720p or 1080p"; return nil; }
+  }
+  int fps = 30;
+  id fpsValue = video[@"fps"];
+  if (fpsValue && fpsValue != [NSNull null]) {
+    if (![fpsValue isKindOfClass:[NSNumber class]] || [fpsValue intValue] < 1 || [fpsValue intValue] > 30) {
+      *error = @"video.fps must be between 1 and 30"; return nil;
+    }
+    fps = [fpsValue intValue];
+  }
+  int bitrate = 1800;
+  id bitrateValue = video[@"bitrateKbps"];
+  if (bitrateValue && bitrateValue != [NSNull null]) {
+    if (![bitrateValue isKindOfClass:[NSNumber class]] || [bitrateValue intValue] < 100 || [bitrateValue intValue] > 8000) {
+      *error = @"video.bitrateKbps must be between 100 and 8000"; return nil;
+    }
+    bitrate = [bitrateValue intValue];
+  }
+  TRTCVideoEncParam *enc = [[TRTCVideoEncParam alloc] init];
+  enc.videoResolution = resolution;
+  enc.resMode = TRTCVideoResolutionModePortrait;
+  enc.videoFps = fps;
+  enc.videoBitrate = bitrate;
+  return enc;
+}
+
 - (TRTCParams *)params:(NSDictionary *)args viewer:(BOOL)viewer {
   TRTCParams *p = [[TRTCParams alloc] init];
   p.sdkAppId = [args[@"sdkAppId"] intValue];
@@ -298,6 +340,8 @@ RCT_EXPORT_MODULE(NosmaiTencentBridge)
     if (![self checkCredentials:args viewer:NO error:&error]) {
       reject(@"INVALID_ARGUMENT", error, nil); return;
     }
+    TRTCVideoEncParam *enc = [self encoderParam:args error:&error];
+    if (!enc) { reject(@"INVALID_ARGUMENT", error, nil); return; }
     // React Native iOS Host uses the same NosmaiCore-owned camera as Flutter.
     // Refuse empty video sessions rather than showing an apparently joined
     // TRTC room with a black Viewer.
@@ -306,11 +350,6 @@ RCT_EXPORT_MODULE(NosmaiTencentBridge)
       return;
     }
     TRTCCloud *rtc = [self ensureCloud];
-    TRTCVideoEncParam *enc = [[TRTCVideoEncParam alloc] init];
-    enc.videoResolution = TRTCVideoResolution_1280_720;
-    enc.resMode = TRTCVideoResolutionModePortrait;
-    enc.videoFps = 30;
-    enc.videoBitrate = 1800;
     [rtc setVideoEncoderParam:enc];
     _roomConnected = NO; _hostRequested = YES;
     _uplinkFps = 0; _uplinkKbps = 0; _outputWidth = 0; _outputHeight = 0;
@@ -335,6 +374,18 @@ RCT_EXPORT_MODULE(NosmaiTencentBridge)
   }
   if ([name isEqualToString:@"stop"]) {
     [self stopHost]; resolve(nil); return;
+  }
+  if ([name isEqualToString:@"muteLocalAudio"] || [name isEqualToString:@"muteLocalVideo"]) {
+    if (!_hostRequested || !_rtc) {
+      reject(@"HOST_NOT_STREAMING", @"Host is not streaming", nil); return;
+    }
+    BOOL mute = [args[@"mute"] boolValue];
+    if ([name isEqualToString:@"muteLocalAudio"]) {
+      [_rtc muteLocalAudio:mute]; self.audioMuted = mute;
+    } else {
+      [_rtc muteLocalVideo:TRTCVideoStreamTypeBig mute:mute]; self.videoMuted = mute;
+    }
+    resolve(nil); return;
   }
   if ([name isEqualToString:@"viewerJoin"]) {
     if (_hostRequested || _viewerRequested || _exitPending) {
@@ -448,6 +499,12 @@ RCT_EXPORT_METHOD(start:(NSDictionary *)options resolver:(RCTPromiseResolveBlock
 RCT_EXPORT_METHOD(stop:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
   [self invoke:@"stop" args:@{} resolver:resolve rejecter:reject];
 }
+RCT_EXPORT_METHOD(muteLocalAudio:(BOOL)mute resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  [self invoke:@"muteLocalAudio" args:@{@"mute":@(mute)} resolver:resolve rejecter:reject];
+}
+RCT_EXPORT_METHOD(muteLocalVideo:(BOOL)mute resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  [self invoke:@"muteLocalVideo" args:@{@"mute":@(mute)} resolver:resolve rejecter:reject];
+}
 RCT_EXPORT_METHOD(viewerJoin:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
   [self invoke:@"viewerJoin" args:options resolver:resolve rejecter:reject];
 }
@@ -457,6 +514,344 @@ RCT_EXPORT_METHOD(viewerLeave:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromi
 RCT_EXPORT_METHOD(dispose:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
   [self invoke:@"dispose" args:@{} resolver:resolve rejecter:reject];
 }
+#pragma mark - Nosmai effects (iOS Host)
+// The iOS Host camera is owned by this bridge (NosmaiCore), so the RN SDK's
+// visual APIs reject (they require their own startProcessing camera owner,
+// which must not run on the Host screen). These methods call the same
+// NosmaiCore / NosmaiEffectsEngine APIs the RN SDK uses, on the main thread.
+
+static NSString *NTBNonEmptyString(id value) {
+  if ([value isKindOfClass:[NSString class]] && [value length] > 0) return value;
+  if ([value isKindOfClass:[NSNumber class]]) return [value stringValue];
+  return nil;
+}
+
+static NSString *NTBPackageTypeFromNative(NosmaiFilterType type) {
+  switch (type) {
+    case NosmaiFilterTypeEffect: return @"effect";
+    case NosmaiFilterTypeBeautyEffect: return @"beauty_effect";
+    case NosmaiFilterTypeBackground: return @"background";
+    case NosmaiFilterTypeGame: return @"game";
+    default: return @"filter";
+  }
+}
+
+// Cloud catalogs use category names (effects, bg, beauty_effects, games).
+static NSString *NTBPackageTypeFromCloud(id raw) {
+  NSString *value = [NTBNonEmptyString(raw) lowercaseString];
+  if (!value) return nil;
+  if ([value isEqualToString:@"filter"] || [value isEqualToString:@"filters"]) return @"filter";
+  if ([value isEqualToString:@"effect"] || [value isEqualToString:@"effects"]) return @"effect";
+  if ([value isEqualToString:@"bg"] || [value isEqualToString:@"background"] || [value isEqualToString:@"backgrounds"]) return @"background";
+  if ([value isEqualToString:@"beauty_effect"] || [value isEqualToString:@"beauty_effects"]) return @"beauty_effect";
+  if ([value isEqualToString:@"game"] || [value isEqualToString:@"games"]) return @"game";
+  return nil;
+}
+
+static NSString *NTBCloudCategoryForType(NSString *type) {
+  if ([type isEqualToString:@"filter"]) return @"filter";
+  if ([type isEqualToString:@"effect"]) return @"effects";
+  if ([type isEqualToString:@"background"]) return @"bg";
+  if ([type isEqualToString:@"beauty_effect"]) return @"beauty_effects";
+  if ([type isEqualToString:@"game"]) return @"games";
+  return nil;
+}
+
+static BOOL NTBNativeFilterType(NSString *type, NosmaiFilterType *out) {
+  if ([type isEqualToString:@"filter"]) { *out = NosmaiFilterTypeFilter; return YES; }
+  if ([type isEqualToString:@"effect"]) { *out = NosmaiFilterTypeEffect; return YES; }
+  if ([type isEqualToString:@"background"]) { *out = NosmaiFilterTypeBackground; return YES; }
+  if ([type isEqualToString:@"beauty_effect"]) { *out = NosmaiFilterTypeBeautyEffect; return YES; }
+  if ([type isEqualToString:@"game"]) { *out = NosmaiFilterTypeGame; return YES; }
+  return NO;
+}
+
+static BOOL NTBReshapeType(NSString *name, NosmaiReshapeType *out) {
+  NSDictionary<NSString *, NSNumber *> *map = @{
+    @"lip": @(NosmaiReshapeTypeLip), @"faceSlim": @(NosmaiReshapeTypeFaceSlim),
+    @"eye": @(NosmaiReshapeTypeEye), @"nose": @(NosmaiReshapeTypeNose),
+    @"chin": @(NosmaiReshapeTypeChin), @"brow": @(NosmaiReshapeTypeBrow),
+    @"browThickness": @(NosmaiReshapeTypeBrowThickness), @"jaw": @(NosmaiReshapeTypeJaw),
+    @"mouthWidth": @(NosmaiReshapeTypeMouthWidth), @"forehead": @(NosmaiReshapeTypeForehead),
+  };
+  NSNumber *value = [name isKindOfClass:[NSString class]] ? map[name] : nil;
+  if (!value) return NO;
+  *out = (NosmaiReshapeType)value.integerValue;
+  return YES;
+}
+
+static NSString *NTBLocalPath(id input) {
+  NSString *value = NTBNonEmptyString(input);
+  if (!value) return nil;
+  if ([value hasPrefix:@"file://"]) value = [NSURL URLWithString:value].path;
+  return (value.length > 0 && [NSFileManager.defaultManager isReadableFileAtPath:value]) ? value : nil;
+}
+
+- (NosmaiEffectsEngine *)readyEffects:(RCTPromiseRejectBlock)reject {
+  NosmaiEffectsEngine *effects = [NosmaiCore shared].effects;
+  if (!self.nosmaiCapturing || !effects) {
+    reject(@"NOSMAI_NOT_CAPTURING", @"Start the iOS Nosmai camera (initializeNosmaiCamera) before using effects", nil);
+    return nil;
+  }
+  return effects;
+}
+
+- (NSDictionary *)cloudItemFromRaw:(NSDictionary *)raw requestedType:(NSString *)requestedType effects:(NosmaiEffectsEngine *)effects {
+  if (![raw isKindOfClass:[NSDictionary class]]) return nil;
+  NSString *filterId = NTBNonEmptyString(raw[@"filterId"]) ?: NTBNonEmptyString(raw[@"id"]);
+  if (!filterId) return nil;
+  NSString *name = NTBNonEmptyString(raw[@"name"]) ?: NTBNonEmptyString(raw[@"slug"]) ?: filterId;
+  NSString *displayName = NTBNonEmptyString(raw[@"displayName"]) ?: name;
+  NSString *type = requestedType ?: NTBPackageTypeFromCloud(raw[@"filterType"]) ?:
+      NTBPackageTypeFromCloud(raw[@"packageType"]) ?: NTBPackageTypeFromCloud(raw[@"filterCategory"]) ?:
+      NTBPackageTypeFromCloud(raw[@"category"]) ?: @"filter";
+  NSString *path = NTBLocalPath(raw[@"localPath"]) ?: NTBLocalPath(raw[@"path"]);
+  @try {
+    if (!path && [effects isCloudFilterDownloaded:filterId]) path = NTBLocalPath([effects getCloudFilterLocalPath:filterId]);
+  } @catch (__unused NSException *exception) { path = nil; }
+  NSString *preview = nil;
+  for (NSString *key in @[@"previewUrl", @"mobilePreviewUrl", @"thumbnailUrl", @"filterPreview"]) {
+    NSString *candidate = NTBNonEmptyString(raw[key]);
+    if ([candidate hasPrefix:@"https://"] || [candidate hasPrefix:@"http://"]) { preview = candidate; break; }
+  }
+  BOOL isFree = [raw[@"isFree"] isKindOfClass:[NSNumber class]] ? [raw[@"isFree"] boolValue]
+      : ([raw[@"price"] isKindOfClass:[NSNumber class]] ? [raw[@"price"] doubleValue] == 0.0 : YES);
+  NSMutableDictionary *item = [@{
+    @"id": filterId, @"name": name, @"displayName": displayName, @"type": type,
+    @"location": @"cloud", @"isDownloaded": @(path != nil), @"isFree": @(isFree),
+  } mutableCopy];
+  if (path) item[@"path"] = path;
+  if (preview) item[@"previewUrl"] = preview;
+  NSString *category = NTBNonEmptyString(raw[@"category"]) ?: NTBNonEmptyString(raw[@"filterCategory"]);
+  if (category) item[@"category"] = category;
+  return item;
+}
+
+RCT_EXPORT_METHOD(effectsCapabilities:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    @try {
+      resolve(@{ @"beauty": @([effects isBeautyEffectEnabled]),
+                 @"cloud": @([effects isCloudFilterEnabled]),
+                 @"advanced": @([effects isAdvancedFiltersEnabled]) });
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECTS", e.reason ?: @"Capability check failed", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsGetLocal:(NSString *)type resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (![self readyEffects:reject]) return;
+    NosmaiFilterType nativeType = NosmaiFilterTypeUnknown;
+    if (type && !NTBNativeFilterType(type, &nativeType)) {
+      reject(@"INVALID_ARGUMENT", @"type must be filter, effect, background, beauty_effect or game", nil); return;
+    }
+    @try {
+      NosmaiSDK *sdk = [NosmaiSDK sharedInstance];
+      NSArray<NosmaiFilterInfo *> *list = type ? [sdk getFiltersOfType:nativeType] : [sdk getFilters];
+      NSMutableArray *items = [NSMutableArray array];
+      for (NosmaiFilterInfo *info in list) {
+        NSString *path = NTBLocalPath(info.path);
+        if (!path) continue;
+        NSString *name = info.name ?: path.lastPathComponent.stringByDeletingPathExtension;
+        NSMutableDictionary *item = [@{
+          @"id": path, @"name": name, @"displayName": info.displayName ?: name,
+          @"type": NTBPackageTypeFromCloud(info.typeKey) ?: NTBPackageTypeFromNative(info.type),
+          @"path": path, @"location": @"local", @"isDownloaded": @YES, @"isFree": @YES,
+        } mutableCopy];
+        if (info.hasPreview && info.previewPath) item[@"previewPath"] = info.previewPath;
+        [items addObject:item];
+      }
+      resolve(items);
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECTS", e.reason ?: @"Unable to read local Nosmai packages", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsGetCloud:(NSString *)type resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    NSString *category = type ? NTBCloudCategoryForType(type) : nil;
+    if (type && !category) {
+      reject(@"INVALID_ARGUMENT", @"type must be filter, effect, background, beauty_effect or game", nil); return;
+    }
+    @try {
+      if (![effects isCloudFilterEnabled]) {
+        reject(@"NOSMAI_CLOUD_DISABLED", @"Cloud filters are not enabled for this Nosmai license", nil); return;
+      }
+      NosmaiCloudFilterRequestOptions *options = [NosmaiCloudFilterRequestOptions defaultOptions];
+      options.version = NosmaiCloudFilterVersion2;
+      options.fetchAllPages = YES;
+      options.filterType = category;
+      [effects getCloudFiltersWithOptions:options completion:^(NSArray<NSDictionary *> *filters,
+                                                               __unused NosmaiCloudFilterPaginationInfo *pagination,
+                                                               NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (error) { reject(@"NOSMAI_CLOUD", error.localizedDescription ?: @"Cloud catalog request failed", error); return; }
+          NSMutableArray *items = [NSMutableArray array];
+          for (id raw in filters ?: @[]) {
+            NSDictionary *item = [self cloudItemFromRaw:raw requestedType:type effects:effects];
+            if (item) [items addObject:item];
+          }
+          resolve(items);
+        });
+      }];
+    } @catch (NSException *e) { reject(@"NOSMAI_CLOUD", e.reason ?: @"Cloud catalog request failed", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsDownloadCloud:(NSString *)filterId resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    if (!NTBNonEmptyString(filterId)) { reject(@"INVALID_ARGUMENT", @"filterId is required", nil); return; }
+    @try {
+      if ([effects isCloudFilterDownloaded:filterId]) {
+        NSString *existing = NTBLocalPath([effects getCloudFilterLocalPath:filterId]);
+        if (existing) { resolve(@{ @"filterId": filterId, @"path": existing, @"alreadyDownloaded": @YES }); return; }
+      }
+      __block int lastPercent = -10;
+      [effects downloadCloudFilter:filterId progress:^(float progress) {
+        int percent = (int)(progress * 100.0f);
+        if (percent - lastPercent < 10 && percent < 100) return;
+        lastPercent = percent;
+        [self emit:@"cloudDownloadProgress" message:@"Cloud package download progress" viewer:NO
+             extra:@{ @"filterId": filterId, @"progress": @(MAX(0.0f, MIN(1.0f, progress))) }];
+      } completion:^(BOOL success, NSString *localPath, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          NSString *path = NTBLocalPath(localPath);
+          if (!success || !path) {
+            reject(@"NOSMAI_CLOUD_DOWNLOAD", error.localizedDescription ?: @"Cloud package download failed", error); return;
+          }
+          resolve(@{ @"filterId": filterId, @"path": path, @"alreadyDownloaded": @NO });
+        });
+      }];
+    } @catch (NSException *e) { reject(@"NOSMAI_CLOUD_DOWNLOAD", e.reason ?: @"Cloud package download failed", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsApply:(NSString *)packagePath resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    NSString *path = NTBLocalPath(packagePath);
+    if (!path) { reject(@"INVALID_ARGUMENT", @"packagePath must be a readable local .nosmai file", nil); return; }
+    @try {
+      // Type-aware: the SDK routes filter / AR / background / beauty packages to their slot.
+      [effects applyEffect:path completion:^(BOOL success, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (!success || error) { reject(@"NOSMAI_EFFECT_APPLY", error.localizedDescription ?: @"The package could not be applied", error); return; }
+          resolve(@YES);
+        });
+      }];
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECT_APPLY", e.reason ?: @"The package could not be applied", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsClear:(NSString *)kind resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    @try {
+      if ([kind isEqualToString:@"filter"]) [effects clearFilter];
+      else if ([kind isEqualToString:@"effect"]) [effects clearAREffect];
+      else if ([kind isEqualToString:@"background"]) [effects clearBackgroundSegmentation];
+      else if ([kind isEqualToString:@"reshape"]) [effects clearReshapes];
+      else if ([kind isEqualToString:@"beauty"]) {
+        // Same narrow scope as the RN SDK's clearBeauty: packages and backgrounds survive.
+        [effects applySkinSmoothing:0.0f];
+        [effects applySkinWhitening:0.0f];
+        [effects applyTeethWhitening:0.0f];
+        [effects clearReshapes];
+      } else if ([kind isEqualToString:@"all"]) [effects clearAll];
+      else { reject(@"INVALID_ARGUMENT", @"kind must be filter, effect, background, beauty, reshape or all", nil); return; }
+      resolve(nil);
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECTS", e.reason ?: @"Clear failed", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsSetBeauty:(NSString *)control value:(double)value resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    if (!isfinite(value) || value < 0.0 || value > 1.0) { reject(@"INVALID_ARGUMENT", @"Beauty value must be between 0 and 1", nil); return; }
+    @try {
+      if (value > 0.0 && ![effects isBeautyEffectEnabled]) {
+        reject(@"NOSMAI_BEAUTY_DISABLED", @"Beauty effects are not enabled for this Nosmai license", nil); return;
+      }
+      float level = (float)value;
+      if ([control isEqualToString:@"skinSmoothing"]) [effects applySkinSmoothing:level];
+      else if ([control isEqualToString:@"skinWhitening"]) [effects applySkinWhitening:level];
+      else if ([control isEqualToString:@"teethWhitening"]) [effects applyTeethWhitening:level];
+      else { reject(@"INVALID_ARGUMENT", @"control must be skinSmoothing, skinWhitening or teethWhitening", nil); return; }
+      resolve(nil);
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECTS", e.reason ?: @"Beauty change failed", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsSetReshape:(NSString *)type value:(double)value resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    NosmaiReshapeType nativeType;
+    if (!NTBReshapeType(type, &nativeType) || !isfinite(value) || value < -1.0 || value > 1.0) {
+      reject(@"INVALID_ARGUMENT", @"Unknown reshape type or value outside -1..1", nil); return;
+    }
+    @try {
+      if (![effects isBeautyEffectEnabled]) {
+        reject(@"NOSMAI_BEAUTY_DISABLED", @"Beauty effects are not enabled for this Nosmai license", nil); return;
+      }
+      [effects setReshapeType:nativeType value:(float)value];
+      resolve(nil);
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECTS", e.reason ?: @"Reshape change failed", nil); }
+  });
+}
+
+RCT_EXPORT_METHOD(effectsSetBackground:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NosmaiEffectsEngine *effects = [self readyEffects:reject];
+    if (!effects) return;
+    NSString *mode = [options[@"mode"] isKindOfClass:[NSString class]] ? options[@"mode"] : nil;
+    NosmaiBackgroundSegmentationConfig *config = [[NosmaiBackgroundSegmentationConfig alloc] init];
+    if ([mode isEqualToString:@"blur"]) {
+      double strength = [options[@"blurStrength"] doubleValue];
+      if (!isfinite(strength) || strength < 0.0 || strength > 1.0) { reject(@"INVALID_ARGUMENT", @"blurStrength must be between 0 and 1", nil); return; }
+      config.mode = NosmaiBackgroundSegmentationModeBlur;
+      config.blurStrength = (float)strength;
+    } else if ([mode isEqualToString:@"color"]) {
+      NSDictionary *color = [options[@"color"] isKindOfClass:[NSDictionary class]] ? options[@"color"] : nil;
+      double r = [color[@"red"] doubleValue], g = [color[@"green"] doubleValue], b = [color[@"blue"] doubleValue];
+      double a = color[@"alpha"] ? [color[@"alpha"] doubleValue] : 1.0;
+      if (!color || r < 0 || r > 1 || g < 0 || g > 1 || b < 0 || b > 1 || a < 0 || a > 1) {
+        reject(@"INVALID_ARGUMENT", @"color.red/green/blue/alpha must be between 0 and 1", nil); return;
+      }
+      config.mode = NosmaiBackgroundSegmentationModeColor;
+      config.replacementColor = [UIColor colorWithRed:r green:g blue:b alpha:a];
+    } else if ([mode isEqualToString:@"image"] || [mode isEqualToString:@"video"]) {
+      NSString *path = NTBLocalPath(options[@"uri"]);
+      if (!path) { reject(@"INVALID_ARGUMENT", @"uri must be a readable local file", nil); return; }
+      if ([mode isEqualToString:@"image"]) {
+        UIImage *image = [UIImage imageWithContentsOfFile:path];
+        if (!image) { reject(@"INVALID_ARGUMENT", @"uri is not a readable image", nil); return; }
+        config.mode = NosmaiBackgroundSegmentationModeImage;
+        config.replacementImage = image;
+      } else {
+        config.mode = NosmaiBackgroundSegmentationModeVideo;
+        config.replacementVideoURL = [NSURL fileURLWithPath:path];
+      }
+    } else {
+      reject(@"INVALID_ARGUMENT", @"mode must be blur, color, image or video", nil); return;
+    }
+    @try {
+      if (![effects isAdvancedFiltersEnabled]) {
+        reject(@"NOSMAI_ADVANCED_DISABLED", @"Background segmentation is not enabled for this Nosmai license", nil); return;
+      }
+      [effects setBackgroundSegmentation:config];
+      resolve(nil);
+    } @catch (NSException *e) { reject(@"NOSMAI_EFFECTS", e.reason ?: @"Background change failed", nil); }
+  });
+}
+
 - (void)publishProcessedFrame:(CVPixelBufferRef)buffer timestamp:(double)timestamp {
   if (!buffer || !atomic_load(&_frameTapArmed)) return;
   atomic_fetch_add(&_sourceFrames, 1);
@@ -510,6 +905,10 @@ RCT_EXPORT_METHOD(dispose:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRe
   [self disarmProcessedFrameTap];
   if (self.nosmaiCapturing) [self armProcessedFrameTap]; // keep detecting video for next Start
   [self emit:@"stopping" message:@"Host stop requested" viewer:NO extra:nil];
+  // Mute state must not leak into the next Host session.
+  if (self.audioMuted) [_rtc muteLocalAudio:NO];
+  if (self.videoMuted) [_rtc muteLocalVideo:TRTCVideoStreamTypeBig mute:NO];
+  self.audioMuted = NO; self.videoMuted = NO;
   [_rtc stopLocalAudio];
   [_rtc enableCustomVideoCapture:TRTCVideoStreamTypeBig enable:NO];
   [_rtc exitRoom];
@@ -618,6 +1017,8 @@ RCT_EXPORT_METHOD(dispose:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRe
     if (!item) return;
     _uplinkFps = item.frameRate; _uplinkKbps = item.videoBitrate;
     _outputWidth = item.width; _outputHeight = item.height;
+    [self emit:@"fpsStats" message:@"TRTC send statistics" viewer:NO
+         extra:@{@"fps":@(_uplinkFps),@"kbps":@(_uplinkKbps),@"width":@(_outputWidth),@"height":@(_outputHeight)}];
   } else if (_viewerRequested) {
     for (TRTCRemoteStatistics *item in statistics.remoteStatistics) {
       if (![item.userId isEqualToString:_watchedHost]) continue;
